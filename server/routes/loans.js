@@ -1,114 +1,89 @@
+// server/routes/loans.js
 import express from 'express';
 import Loan from '../models/Loan.js';
 import Book from '../models/Book.js';
-import Fine from '../models/Fine.js';
+import Member from '../models/Member.js';
 
 const router = express.Router();
 
-// ENV: fine per day (default 10)
-const FINE_PER_DAY = Number(process.env.FINE_PER_DAY || 10);
-
-// list loans (admin -> all, student -> own)
-router.get('/', async (req, res) => {
-  const q = req.user?.role === 'student' ? { member: req.user.id } : {};
-  const loans = await Loan.find(q).populate('book').populate('member').sort({ createdAt: -1 });
-  res.json(loans);
-});
-
-// create loan (Excel: Issue = today, Return = +15 days max, not past)
-router.post('/', async (req, res) => {
+// GET /api/loans — list loans (populated, newest first)
+router.get('/', async (_req, res) => {
   try {
-    let { book, member, days = 15 } = req.body;
-    if (req.user?.role === 'student') member = req.user.id;
-
-    if (!book)  return res.status(400).json({ error: 'Select a book' });
-    if (!member) return res.status(400).json({ error: 'Select a member' });
-
-    const b = await Book.findById(book);
-    if (!b) return res.status(404).json({ error: 'Book not found' });
-    if (b.copiesAvailable <= 0) return res.status(400).json({ error: 'No available copies' });
-
-    // Excel rules
-    const today = new Date();
-    days = Number(days) || 15;
-    if (days < 1) days = 1;
-    if (days > 15) days = 15;               // <= 15 days
-    const dueAt = new Date(today.getTime() + days * 24 * 60 * 60 * 1000);
-
-    const loan = await Loan.create({ book, member, loanedAt: today, dueAt });
-    b.copiesAvailable -= 1; await b.save();
-
-    res.status(201).json(await loan.populate('book').populate('member'));
+    const loans = await Loan.find({})
+      .populate('book')
+      .populate('member')
+      .sort({ loanedAt: -1 });
+    res.json(loans);
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
-// return loan (Excel: compute fine if overdue; allow confirm and pay)
-router.post('/:id/return', async (req, res) => {
+// POST /api/loans — create a loan
+// body: { book, member, days }
+router.post('/', async (req, res) => {
   try {
-    const loan = await Loan.findById(req.params.id).populate('book').populate('member');
-    if (!loan) return res.status(404).json({ error: 'Loan not found' });
+    const { book, member } = req.body;
+    let { days } = req.body;
+    days = Math.max(1, Math.min(15, Number(days || 15)));
 
-    // students can only return their own loans
-    if (req.user?.role === 'student' && String(loan.member._id) !== String(req.user.id)) {
-      return res.status(403).json({ error: 'Not allowed' });
+    const b = await Book.findById(book);
+    const m = await Member.findById(member);
+    if (!b) return res.status(404).json({ error: 'Book not found' });
+    if (!m) return res.status(404).json({ error: 'Member not found' });
+    if ((b.copiesAvailable ?? 0) < 1) {
+      return res.status(400).json({ error: 'No copies available' });
     }
-    if (loan.returnedAt) return res.status(400).json({ error: 'Already returned' });
 
     const now = new Date();
-    loan.returnedAt = now;
+    const due = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
 
-    // fine calc
-    let fine = 0;
-    if (now > loan.dueAt) {
-      const ms = now.getTime() - loan.dueAt.getTime();
-      const daysLate = Math.ceil(ms / (24 * 60 * 60 * 1000));
-      fine = daysLate * FINE_PER_DAY;
-      loan.fineAmount = fine;
+    const loan = await Loan.create({
+      book,
+      member,
+      loanedAt: now,
+      dueAt: due,
+      fineAmount: 0,
+      finePaid: false,
+    });
+
+    await Book.findByIdAndUpdate(book, { $inc: { copiesAvailable: -1 } });
+
+    const populated = await Loan.findById(loan._id).populate('book').populate('member');
+    res.json(populated);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/loans/:id/return — mark returned + compute fine + increment copies
+router.post('/:id/return', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const loan = await Loan.findById(id).populate('book');
+    if (!loan) return res.status(404).json({ error: 'Loan not found' });
+    if (loan.returnedAt) return res.status(400).json({ error: 'Already returned' });
+
+    loan.returnedAt = new Date();
+
+    const perDay = Number(process.env.FINE_PER_DAY || 10);
+    if (loan.dueAt && loan.returnedAt > loan.dueAt) {
+      const ms = loan.returnedAt - loan.dueAt;
+      const daysLate = Math.ceil(ms / (1000 * 60 * 60 * 24));
+      loan.fineAmount = daysLate * perDay;
       loan.finePaid = false;
     }
 
     await loan.save();
 
-    // restore book availability
-    const b = await Book.findById(loan.book._id);
-    b.copiesAvailable += 1; await b.save();
+    const bookId = loan.book?._id || loan.book;
+    await Book.findByIdAndUpdate(bookId, { $inc: { copiesAvailable: 1 } });
 
-    res.json({ loan, fine });
+    const populated = await Loan.findById(loan._id).populate('book').populate('member');
+    res.json({ ok: true, loan: populated });
   } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
-
-// pay fine for a returned loan
-router.post('/:id/pay-fine', async (req, res) => {
-  try {
-    const { amount, remarks } = req.body;
-    const loan = await Loan.findById(req.params.id).populate('member');
-    if (!loan) return res.status(404).json({ error: 'Loan not found' });
-    if (!loan.returnedAt) return res.status(400).json({ error: 'Return the book first' });
-
-    // <-- FIXED: parenthesize (amount ?? loan.fineAmount) before || 0
-    const toPay = Number((amount ?? loan.fineAmount) || 0);
-    if (toPay <= 0) return res.status(400).json({ error: 'No fine to pay' });
-
-    const fine = await Fine.create({
-      loan: loan._id,
-      member: loan.member._id,
-      amount: toPay,
-      remarks,
-      paid: true,
-      paidAt: new Date()
-    });
-
-    loan.finePaid = true;
-    loan.fineNote = remarks;
-    await loan.save();
-
-    res.json({ ok: true, fine });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
+    console.error('Return route error:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 
